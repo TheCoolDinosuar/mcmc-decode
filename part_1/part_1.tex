@@ -1,0 +1,88 @@
+\documentclass[12pt]{article}
+\usepackage{duan}
+
+\title{6.7800 Project Part \#1}
+\author{Alan Duan}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{enumerate}
+\item \begin{enumerate}[(a)]
+    \item Let $y=(y_1,\dotsc,y_N)$. The probability that we get $y_1$ is
+        $P_{f^{-1}(y_1)}$, and the probability of obtaining $y_k$ after
+        $y_{k-1}$ is $M_{f^{-1}(y_k),f^{-1}(y_{k-1})}$. So,
+        \[P(y\mid
+        f)=P_{f^{-1}(y_1)}\prod_{k=2}^NM_{f^{-1}(y_k),f^{-1}(y_{k-1})}.\]
+    \item By Bayes',
+        \begin{align*}
+            p_{f\mid y}(f\mid y)&=\frac{p_{y\mid f}(y\mid f)p_f(f)}{p_y(y)}\\
+            &=\frac{P_{f^{-1}(y_1)}\prod_{k=2}^NM_{f^{-1}(y_k),f^{-1}(y_{k-1})}}{\sum_{g\in
+        S_N}P_{g^{-1}(y_1)}\prod_{k=2}^NM_{g^{-1}(y_k),g^{-1}(y_{k-1})}}.
+        \end{align*}
+        The MAP estimator of $f$ is the permutation that maximizes the
+        numerator, aka $\hat f_{MAP}=\argmax_f p_{f\mid y}(f\mid y)=\argmax_f
+        p_{y\mid f}(y\mid f)$.
+    \item Maximizing $p_{y\mid f}(y\mid f)$ is computationally infeasible
+        because there $N!$ factorial different possibilities, and its difficult
+        to come up with an algorithm that can do better.
+    \end{enumerate}
+\newpage
+\item
+\begin{enumerate}[(a)]
+    \item There are $m!^2$ pairs of permutations, and there are $m!$ ways to
+        choose the first permutation $f_1$. Then, there are $\binom m2$ different
+        permutations that differ from $f_1$ in exactly two positions (aka a
+        transposition of $f_1$). Thus, the answer is
+        \[\frac{\binom m2}{m!}=\frac{1}{2(m-2)!}.\]
+    \item We use the distribution from 2(a) as our proposal distribution. That
+        is, 
+        \[v(f'\mid f)=\frac{1}{2(m-2)!}.\]
+        Thus, the MH algorithm produces the following Markov chain:
+        \begin{enumerate}
+        \item Choose $x_0$ arbitrarily from possible $f\in S_n$.
+        \item Assume we have some $x_n$.
+        \item Generate a new $f'$ from $f$ by using the distribution
+            $v(\cdot\mid f)$.
+        \item The acceptance factor is
+            \[a(f\to f')=\min\left(1,\frac{p_{y\mid f}(y\mid f')}{p_{y\mid
+            f}(y\mid f)}\right).\]
+        \item Now choose either to accept or reject this transition with
+            probability $a(f\to f')$, and this becomes our new $x_{n+1}$.
+        \end{enumerate}
+    \item \begin{enumerate}
+        \item Sample an $f$ from the a posterior distribution by running the
+            algorithm in 2(b) sufficiently many times.
+        \item Draw many samples from the posterior distribution.
+        \item The permutation with the highest frequency is the MAP estimator.
+        \end{enumerate}
+    \end{enumerate}
+\newpage
+\item \begin{enumerate}[(a)]
+    \item \begin{center}
+            \includegraphics[scale=.5]{graphs/log_likelihood.png}
+        \end{center}
+    \item \begin{center}
+            \includegraphics[scale=.5]{graphs/acceptance_rate.png}
+        \end{center}
+    \item \begin{center}
+            \includegraphics[scale=.5]{graphs/accuracy.png}
+        \end{center}
+    \item \begin{center}
+            \includegraphics[scale=.5]{graphs/segment_experiment.png}
+        \end{center}
+        Longer segments lead to higher accuracy. This is because on shorter
+        segments, there is more noise and less accurate estimations can do
+        decently as well as the optimal, while for longer segments there's more
+        statistical evidence and the optimal does a lot better than things that
+        aren't optimal.
+    \item \begin{center}
+            \includegraphics[scale=.5]{graphs/bits_per_symbol.png}
+        \end{center}
+        Because it is only a Markov chain looking at the previous characters, it
+        doesn't cover English semantics or longer range contexts. Therefore
+        entropy is likely to be higher.
+    \end{enumerate}
+\end{enumerate}
+\end{document}
