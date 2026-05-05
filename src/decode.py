@@ -100,9 +100,9 @@ def _greedy_climb(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.nda
             break
     return inv_per, cur_score
 
-_FULL_BURN_IN = 20000
-_FULL_ITERATIONS = 200000
-_GREEDY_RESTARTS = 200
+_FULL_BURN_IN = 5000
+_FULL_ITERATIONS = 30000
+_GREEDY_RESTARTS = 30
 
 # All disjoint pairs of swaps — precomputed once for the 2-swap neighbourhood search
 _SWAP_PAIRS: list[tuple[int, int]] = [
@@ -147,7 +147,7 @@ def _two_swap_refine(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.
         inv_per, cur_score = _greedy_climb(B, ci_0, inv_per)
     return inv_per, cur_score
 
-_TOP_LEVEL_RUNS = 3   # independent full runs; best LL across all is returned
+_TOP_LEVEL_RUNS = 2   # independent full runs; best LL across all is returned
 
 def _map_estimate_once(ciphertext: str, B: np.ndarray, ci_0: int,
                        burn_in: int, num_iterations: int) -> tuple[np.ndarray, float]:
@@ -324,9 +324,19 @@ def _dictionary_refine(decoded: str) -> str:
     if not _WORD_SET:
         return decoded
 
+    from collections import Counter
     letters = _string.ascii_lowercase
     for _ in range(10):          # at most 10 rounds; converges in 1–2 in practice
         words = [tok.rstrip('.') for tok in decoded.split(' ') if tok.rstrip('.')]
+        char_counts = Counter(decoded)
+
+        # Safety constraint: only consider swapping characters that are RARE
+        # (appear ≤ 5 times in the decoded text). Common characters like 'e' or 't'
+        # are never confused by a correct MCMC run; swapping them would corrupt the
+        # output. Rare characters (e.g. 'q' appearing 3 times) are plausible confusions.
+        rare = {c for c in letters if char_counts.get(c, 0) <= 5}
+        if not rare:
+            break
 
         # Net score = words fixed − words broken.
         # Many swaps can "fix" a non-dict word (e.g. "qust"→"dust","gust","just"…),
@@ -334,6 +344,9 @@ def _dictionary_refine(decoded: str) -> str:
         net: dict[tuple[str, str], int] = {}
         for i, c in enumerate(letters):
             for c2 in letters[i + 1:]:
+                # At least one character in the pair must be rare
+                if c not in rare and c2 not in rare:
+                    continue
                 tbl = str.maketrans(c + c2, c2 + c)
                 affected = [w for w in words if c in w or c2 in w]
                 if not affected:
