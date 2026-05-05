@@ -1,5 +1,7 @@
 import numpy as np
 import random
+import os as _os
+import string as _string
 
 # f: Per is the permutation that maps i to f[i]
 Per = list[int]
@@ -98,35 +100,62 @@ def _greedy_climb(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.nda
             break
     return inv_per, cur_score
 
-_FULL_BURN_IN = 10000
-_FULL_ITERATIONS = 50000
-_GREEDY_RESTARTS = 50
+_FULL_BURN_IN = 20000
+_FULL_ITERATIONS = 200000
+_GREEDY_RESTARTS = 200
 
-def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: int = _FULL_ITERATIONS) -> Per:
-    """ Given we observed a stirng ciphertext, return the MAP estimator f that
-        may have generated it. Uses the Metropolis-Hastings MCMC algorithm.
+# All disjoint pairs of swaps — precomputed once for the 2-swap neighbourhood search
+_SWAP_PAIRS: list[tuple[int, int]] = [
+    (p, q) for p in range(alph_size) for q in range(p + 1, alph_size)
+]
+_DISJOINT_TWO_SWAPS: list[tuple[int, int, int, int]] = [
+    (p1, q1, p2, q2)
+    for i, (p1, q1) in enumerate(_SWAP_PAIRS)
+    for (p2, q2) in _SWAP_PAIRS[i + 1:]
+    if len({p1, q1, p2, q2}) == 4   # swaps share no character
+]
 
-        Internal LL uses precomputed bigram counts + numpy for O(a²) per evaluation
-        instead of O(n), giving ~100x speedup that funds more restarts and iterations.
+def _two_swap_refine(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.ndarray, float]:
+    """Exhaustively search the disjoint 2-swap neighbourhood of inv_per.
 
-        Phase 1: frequency-based init → greedy hill-climb to a local optimum.
-        Phase 2: multi-start greedy — perturb + re-climb 20 times, keeping the best.
-        Phase 3: MH-MCMC from the best greedy warm start. """
-    if len(ciphertext) == 0:
-        return _identity_per()
+    Single-swap greedy gets stuck when the global optimum requires two characters
+    to be reassigned simultaneously (a local optimum under 1-swaps that is not
+    a local optimum under 2-swaps). For a=28 there are ~61k disjoint pairs;
+    at O(a²) per evaluation this takes ~300ms per outer loop iteration.
+    After each improving 2-swap we re-run greedy to reach the new local optimum
+    before searching again.
+    """
+    inv_per = inv_per.copy()
+    cur_score = _ll_fast(B, ci_0, inv_per)
+    while True:
+        best_score = cur_score
+        best_swap = None
+        for p1, q1, p2, q2 in _DISJOINT_TWO_SWAPS:
+            inv_per[p1], inv_per[q1] = inv_per[q1], inv_per[p1]
+            inv_per[p2], inv_per[q2] = inv_per[q2], inv_per[p2]
+            s = _ll_fast(B, ci_0, inv_per)
+            if s > best_score:
+                best_score = s
+                best_swap = (p1, q1, p2, q2)
+            inv_per[p2], inv_per[q2] = inv_per[q2], inv_per[p2]
+            inv_per[p1], inv_per[q1] = inv_per[q1], inv_per[p1]
+        if best_swap is None:
+            break
+        p1, q1, p2, q2 = best_swap
+        inv_per[p1], inv_per[q1] = inv_per[q1], inv_per[p1]
+        inv_per[p2], inv_per[q2] = inv_per[q2], inv_per[p2]
+        inv_per, cur_score = _greedy_climb(B, ci_0, inv_per)
+    return inv_per, cur_score
 
-    # Precompute bigram counts once — used by all subsequent LL evaluations
-    ci = [alphabet[c] for c in ciphertext]
-    B = np.zeros((alph_size, alph_size))
-    for k in range(len(ci) - 1):
-        B[ci[k], ci[k + 1]] += 1
-    ci_0 = ci[0]
+_TOP_LEVEL_RUNS = 3   # independent full runs; best LL across all is returned
 
-    # Phase 1: frequency-matched init → first greedy local optimum
-    # Work in decoder (inv_per) space throughout for consistency with _ll_fast
+def _map_estimate_once(ciphertext: str, B: np.ndarray, ci_0: int,
+                       burn_in: int, num_iterations: int) -> tuple[np.ndarray, float]:
+    """One complete run of phases 1-4. Returns (best_inv_per, best_score)."""
+    # Phase 1: frequency init → greedy
     best_inv, best_score = _greedy_climb(B, ci_0, np.array(inv(_freq_init(ciphertext))))
 
-    # Phase 2: multi-start greedy — perturb best decoder and re-climb
+    # Phase 2: multi-start greedy restarts
     for _ in range(_GREEDY_RESTARTS):
         perturbed = best_inv.copy()
         for _ in range(random.randint(2, 4)):
@@ -136,7 +165,7 @@ def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: 
         if score > best_score:
             best_inv, best_score = restart_inv, score
 
-    # Phase 3: MH-MCMC from the best greedy warm start
+    # Phase 3: MH-MCMC warm start
     cur_inv = best_inv.copy()
     cur_score = best_score
     for iter_no in range(num_iterations):
@@ -151,6 +180,32 @@ def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: 
             cur_score = new_score
         else:
             cur_inv[c_p], cur_inv[c_q] = cur_inv[c_q], cur_inv[c_p]
+
+    # Phase 4: exhaustive disjoint 2-swap neighbourhood
+    best_inv, best_score = _two_swap_refine(B, ci_0, best_inv)
+
+    return best_inv, best_score
+
+def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: int = _FULL_ITERATIONS) -> Per:
+    """ Given we observed a stirng ciphertext, return the MAP estimator f that
+        may have generated it. Uses the Metropolis-Hastings MCMC algorithm.
+
+        Runs _TOP_LEVEL_RUNS independent chains and returns the one with the
+        highest log-likelihood, giving multiple chances to escape hard local optima. """
+    if len(ciphertext) == 0:
+        return _identity_per()
+
+    ci = [alphabet[c] for c in ciphertext]
+    B = np.zeros((alph_size, alph_size))
+    for k in range(len(ci) - 1):
+        B[ci[k], ci[k + 1]] += 1
+    ci_0 = ci[0]
+
+    best_inv, best_score = _map_estimate_once(ciphertext, B, ci_0, burn_in, num_iterations)
+    for _ in range(_TOP_LEVEL_RUNS - 1):
+        inv_candidate, score = _map_estimate_once(ciphertext, B, ci_0, burn_in, num_iterations)
+        if score > best_score:
+            best_inv, best_score = inv_candidate, score
 
     return inv(list(best_inv))
 
@@ -237,13 +292,78 @@ def _best_breakpoint_split(ciphertext: str) -> tuple[int, Per, Per]:
 
     return best_s, enc_l, enc_r
 
+# ---------------------------------------------------------------------------
+# Dictionary-based post-processing
+# ---------------------------------------------------------------------------
+
+def _load_word_set() -> frozenset[str]:
+    # Path is relative to this file's parent directory (project root)
+    word_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'words_alpha.txt')
+    try:
+        with open(word_file) as f:
+            words = frozenset(line.strip().lower() for line in f if line.strip().isalpha())
+        return words | {'a', 'i'}   # ensure common single-letter words are present
+    except FileNotFoundError:
+        return frozenset()
+
+_WORD_SET: frozenset[str] = _load_word_set()
+
+def _dictionary_refine(decoded: str) -> str:
+    """Greedily swap character pairs to maximise the number of dictionary words.
+
+    After MCMC decoding, rare characters (e.g. 'j' vs 'q') are sometimes swapped
+    because they occur too infrequently for the bigram statistics to distinguish
+    them. The substitution cipher maps every instance of a character identically,
+    so one global swap of the two confused characters fixes all words at once.
+
+    For each non-dictionary word we try all C(26,2)=325 simultaneous pairwise
+    swaps (using str.translate, which swaps both directions atomically) and vote
+    for whichever swap fixes the most words. We apply the winning swap if at least
+    2 words agree, then repeat until no confident swap remains.
+    """
+    if not _WORD_SET:
+        return decoded
+
+    letters = _string.ascii_lowercase
+    for _ in range(10):          # at most 10 rounds; converges in 1–2 in practice
+        words = [tok.rstrip('.') for tok in decoded.split(' ') if tok.rstrip('.')]
+
+        # Net score = words fixed − words broken.
+        # Many swaps can "fix" a non-dict word (e.g. "qust"→"dust","gust","just"…),
+        # but only the correct swap avoids breaking currently-valid words.
+        net: dict[tuple[str, str], int] = {}
+        for i, c in enumerate(letters):
+            for c2 in letters[i + 1:]:
+                tbl = str.maketrans(c + c2, c2 + c)
+                affected = [w for w in words if c in w or c2 in w]
+                if not affected:
+                    continue
+                fixed  = sum(1 for w in affected if w not in _WORD_SET
+                             and (t := w.translate(tbl)) != w and t in _WORD_SET)
+                broken = sum(1 for w in affected if w     in _WORD_SET
+                             and w.translate(tbl) not in _WORD_SET)
+                score = fixed - broken
+                if score > 0:
+                    net[(c, c2)] = score
+
+        if not net:
+            break
+        best = max(net, key=lambda k: net[k])
+        if net[best] < 2:        # require net gain of at least 2 words
+            break
+        c1, c2 = best
+        decoded = decoded.translate(str.maketrans(c1 + c2, c2 + c1))
+
+    return decoded
+
 def decode(ciphertext: str, has_breakpoint: bool) -> str:
     if not has_breakpoint:
         encoder: Per = map_estimate(ciphertext)
-        return _plaintext_under_encoder(ciphertext, encoder)
-
-    split, enc_left, enc_right = _best_breakpoint_split(ciphertext)
-    return (
-        _plaintext_under_encoder(ciphertext[:split], enc_left)
-        + _plaintext_under_encoder(ciphertext[split:], enc_right)
-    )
+        result = _plaintext_under_encoder(ciphertext, encoder)
+    else:
+        split, enc_left, enc_right = _best_breakpoint_split(ciphertext)
+        result = (
+            _plaintext_under_encoder(ciphertext[:split], enc_left)
+            + _plaintext_under_encoder(ciphertext[split:], enc_right)
+        )
+    return _dictionary_refine(result)
