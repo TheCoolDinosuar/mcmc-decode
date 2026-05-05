@@ -9,5 +9,18 @@
 \maketitle
 
 \section{Things I tried}
+\begin{enumerate}
+\item Iterate through all positions assuming it is the breakpoint, running the
+    decode algorithm on the first and second segments for each iteration. This
+    is actually massively slow, as if you try to decrease iterations the
+    accuracy drops off to the point of being pointless.
+\item Instead of iterating, I implemented binary search, where you call decode
+    on each half but with less iterations for efficiency, and whichever half has
+    the worse decode rate is determined to contained the breakpoint. Once you
+    reach this end, run the whole MCMC algorithm again but with the full number
+    of iterations. This is still slow.
+\item Still do binary search, but instead look at the bigram distribution and
+    determine where it changes the most.
+\end{enumerate}
 
 \end{document}
