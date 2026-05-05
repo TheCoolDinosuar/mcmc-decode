@@ -402,11 +402,12 @@ def _dictionary_refine(decoded: str) -> str:
 def decode(ciphertext: str, has_breakpoint: bool) -> str:
     if not has_breakpoint:
         encoder: Per = map_estimate(ciphertext)
-        result = _plaintext_under_encoder(ciphertext, encoder)
-    else:
-        split, enc_left, enc_right = _best_breakpoint_split(ciphertext)
-        result = (
-            _plaintext_under_encoder(ciphertext[:split], enc_left)
-            + _plaintext_under_encoder(ciphertext[split:], enc_right)
-        )
-    return _dictionary_refine(result)
+        return _dictionary_refine(_plaintext_under_encoder(ciphertext, encoder))
+
+    split, enc_left, enc_right = _best_breakpoint_split(ciphertext)
+    # Each half uses an independent cipher, so dictionary refinement must be
+    # applied separately — a character confusion in one half is unrelated to
+    # the other, and a global swap would partially fix one while breaking the other.
+    left  = _dictionary_refine(_plaintext_under_encoder(ciphertext[:split], enc_left))
+    right = _dictionary_refine(_plaintext_under_encoder(ciphertext[split:], enc_right))
+    return left + right
