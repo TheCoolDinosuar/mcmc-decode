@@ -100,9 +100,22 @@ def _greedy_climb(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.nda
             break
     return inv_per, cur_score
 
-_FULL_BURN_IN = 5000
-_FULL_ITERATIONS = 30000
-_GREEDY_RESTARTS = 30
+def _mcmc_params(n: int) -> tuple[int, int, int]:
+    """Return (greedy_restarts, burn_in, mh_iterations) scaled to text length.
+
+    Each _ll_fast call is O(a²) regardless of n, so we can run more iterations
+    for short texts (weak signal) without extra wall-clock cost.
+    """
+    if n < 80:
+        return 80,  8000,  40000
+    elif n < 200:
+        return 120, 12000, 60000
+    elif n < 500:
+        return 60,  6000,  30000
+    elif n < 1000:
+        return 40,  5000,  25000
+    else:
+        return 30,  5000,  25000
 
 # All disjoint pairs of swaps — precomputed once for the 2-swap neighbourhood search
 _SWAP_PAIRS: list[tuple[int, int]] = [
@@ -150,17 +163,26 @@ def _two_swap_refine(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.
 _TOP_LEVEL_RUNS = 2   # independent full runs; best LL across all is returned
 
 def _map_estimate_once(ciphertext: str, B: np.ndarray, ci_0: int,
-                       burn_in: int, num_iterations: int) -> tuple[np.ndarray, float]:
+                       greedy_restarts: int, burn_in: int,
+                       num_iterations: int) -> tuple[np.ndarray, float]:
     """One complete run of phases 1-4. Returns (best_inv_per, best_score)."""
     # Phase 1: frequency init → greedy
     best_inv, best_score = _greedy_climb(B, ci_0, np.array(inv(_freq_init(ciphertext))))
 
-    # Phase 2: multi-start greedy restarts
-    for _ in range(_GREEDY_RESTARTS):
-        perturbed = best_inv.copy()
-        for _ in range(random.randint(2, 4)):
-            c_p, c_q = random.sample(range(alph_size), 2)
-            perturbed[c_p], perturbed[c_q] = perturbed[c_q], perturbed[c_p]
+    # Phase 2: multi-start greedy restarts.
+    # Mix perturb-from-best (exploits current best basin) with random starts
+    # (explores completely different regions — important for short texts where
+    # the frequency init may land in the wrong basin).
+    random_fraction = max(1, greedy_restarts // 5)
+    for restart_idx in range(greedy_restarts):
+        if restart_idx < random_fraction:
+            # Fully random starting permutation
+            perturbed = np.random.permutation(alph_size)
+        else:
+            perturbed = best_inv.copy()
+            for _ in range(random.randint(2, 4)):
+                c_p, c_q = random.sample(range(alph_size), 2)
+                perturbed[c_p], perturbed[c_q] = perturbed[c_q], perturbed[c_p]
         restart_inv, score = _greedy_climb(B, ci_0, perturbed)
         if score > best_score:
             best_inv, best_score = restart_inv, score
@@ -186,12 +208,16 @@ def _map_estimate_once(ciphertext: str, B: np.ndarray, ci_0: int,
 
     return best_inv, best_score
 
-def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: int = _FULL_ITERATIONS) -> Per:
+def map_estimate(ciphertext: str,
+                 burn_in: int | None = None,
+                 num_iterations: int | None = None) -> Per:
     """ Given we observed a stirng ciphertext, return the MAP estimator f that
         may have generated it. Uses the Metropolis-Hastings MCMC algorithm.
 
-        Runs _TOP_LEVEL_RUNS independent chains and returns the one with the
-        highest log-likelihood, giving multiple chances to escape hard local optima. """
+        Parameters scale with text length: short texts need many more restarts and
+        iterations because the LL landscape is flatter (less statistical evidence
+        per character). Since _ll_fast is O(a²) regardless of n, this costs no
+        extra wall-clock time vs running fewer iterations on a long text. """
     if len(ciphertext) == 0:
         return _identity_per()
 
@@ -201,11 +227,17 @@ def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: 
         B[ci[k], ci[k + 1]] += 1
     ci_0 = ci[0]
 
-    best_inv, best_score = _map_estimate_once(ciphertext, B, ci_0, burn_in, num_iterations)
+    restarts, _burn_in, _iters = _mcmc_params(len(ciphertext))
+    if burn_in is not None:        _burn_in = burn_in
+    if num_iterations is not None: _iters   = num_iterations
+
+    best_inv, best_score = _map_estimate_once(
+        ciphertext, B, ci_0, restarts, _burn_in, _iters)
     for _ in range(_TOP_LEVEL_RUNS - 1):
-        inv_candidate, score = _map_estimate_once(ciphertext, B, ci_0, burn_in, num_iterations)
+        inv_cand, score = _map_estimate_once(
+            ciphertext, B, ci_0, restarts, _burn_in, _iters)
         if score > best_score:
-            best_inv, best_score = inv_candidate, score
+            best_inv, best_score = inv_cand, score
 
     return inv(list(best_inv))
 
@@ -248,8 +280,10 @@ def _bigram_mi_scores(ciphertext: str) -> np.ndarray:
         return float(np.sum(p[mask] * np.log(p[mask] / denom[mask]))) if mask.any() else 0.0
 
     # Weighted score: n_bigrams * MI — equivalent to the LLR changepoint statistic.
-    # Require MIN_SEG chars on each side so the empirical MI is estimated reliably.
-    MIN_SEG = max(50, n // 10)
+    # MIN_SEG ensures both sides have enough bigrams for a reliable MI estimate.
+    # Capped at 50 for long texts (same as before); relaxed for short texts so
+    # edge breakpoints are reachable.
+    MIN_SEG = max(10, min(50, n // 8))
     scores = np.full(n + 1, -np.inf)
     for s in range(MIN_SEG, n - MIN_SEG + 1):
         n_l = s - 1
@@ -275,8 +309,8 @@ def _best_breakpoint_split(ciphertext: str) -> tuple[int, Per, Per]:
 
     cand = int(np.argmax(_bigram_mi_scores(ciphertext)))
 
-    enc_l = map_estimate(ciphertext[:cand], burn_in=_FULL_BURN_IN, num_iterations=_FULL_ITERATIONS)
-    enc_r = map_estimate(ciphertext[cand:], burn_in=_FULL_BURN_IN, num_iterations=_FULL_ITERATIONS)
+    enc_l = map_estimate(ciphertext[:cand])
+    enc_r = map_estimate(ciphertext[cand:])
     inv_l = np.array(inv(enc_l))
     inv_r = np.array(inv(enc_r))
 
@@ -320,6 +354,28 @@ def _best_breakpoint_split(ciphertext: str) -> tuple[int, Per, Per]:
         if s < n - 1:
             bg_right[ci[s], ci[s + 1]] -= 1
 
+    # Re-estimate ciphers at best_s only when it differs significantly from cand.
+    # If best_s ≈ cand the contamination is negligible; re-estimating would replace
+    # the stronger 2-top-level-run estimate with a single weaker pass.
+    # Threshold: 5% of text length or 10 chars, whichever is larger.
+    reestimate_threshold = max(10, n // 20)
+    if abs(best_s - cand) > reestimate_threshold:
+        restarts, burn_in, iters = _mcmc_params(best_s)
+        B_l = np.zeros((a, a))
+        for k in range(best_s - 1):
+            B_l[ci[k], ci[k + 1]] += 1
+        best_inv_l, _ = _map_estimate_once(
+            ciphertext[:best_s], B_l, ci[0], restarts, burn_in, iters)
+        enc_l = inv(list(best_inv_l))
+
+        restarts, burn_in, iters = _mcmc_params(n - best_s)
+        B_r = np.zeros((a, a))
+        for k in range(best_s, n - 1):
+            B_r[ci[k], ci[k + 1]] += 1
+        best_inv_r, _ = _map_estimate_once(
+            ciphertext[best_s:], B_r, ci[best_s], restarts, burn_in, iters)
+        enc_r = inv(list(best_inv_r))
+
     return best_s, enc_l, enc_r
 
 # ---------------------------------------------------------------------------
@@ -360,11 +416,15 @@ def _dictionary_refine(decoded: str) -> str:
         words = [tok.rstrip('.') for tok in decoded.split(' ') if tok.rstrip('.')]
         char_counts = Counter(decoded)
 
-        # Safety constraint: only consider swapping characters that are RARE
-        # (appear ≤ 5 times in the decoded text). Common characters like 'e' or 't'
-        # are never confused by a correct MCMC run; swapping them would corrupt the
-        # output. Rare characters (e.g. 'q' appearing 3 times) are plausible confusions.
-        rare = {c for c in letters if char_counts.get(c, 0) <= 5}
+        # Safety constraint: only swap characters that are RARE in this text.
+        # rare_thresh = max(2, min(6, n//150)) scales with length:
+        #   - short texts (n<300): thresh=2 — very strict, avoids false swaps
+        #   - medium (n≈630): thresh≈4 — catches 3-occurrence confusions like k/v
+        #   - long (n≥900): thresh=6 — catches j/q and similarly rare chars
+        # Capped at 6 so genuinely common characters (freq>0.3%) are never swapped.
+        n_decoded = len(decoded)
+        rare_thresh = max(2, min(6, n_decoded // 150))
+        rare = {c for c in letters if char_counts.get(c, 0) <= rare_thresh}
         if not rare:
             break
 
