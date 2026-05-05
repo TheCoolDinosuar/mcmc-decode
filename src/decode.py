@@ -262,33 +262,63 @@ def _bigram_mi_scores(ciphertext: str) -> np.ndarray:
 def _best_breakpoint_split(ciphertext: str) -> tuple[int, Per, Per]:
     """Locate split via MI scan, then refine using fixed-cipher LL evaluation.
 
-    1. Weighted bigram MI scan across all valid positions — O(n * a²), no MCMC.
-    2. Run full MCMC once at the MI candidate to estimate enc_L, enc_R.
-    3. Refine split by evaluating those FIXED ciphers at every position in a wide
-       window — O(radius * n), no extra MCMC. This works because for positions
-       close to the true breakpoint the ciphers are approximately correct, and the
-       LL correctly identifies where the split should be.
+    1. Weighted bigram MI scan — O(n * a²), no MCMC.
+    2. Full MCMC at the MI candidate to estimate enc_L, enc_R.
+    3. Fixed-cipher sweep over a window using _ll_fast with incrementally-updated
+       prefix bigram matrices — O(radius * a²), independent of n.
+       Previously used log_likelihood (O(n) Python loop × radius steps = O(n²) total);
+       this replaces it with O(a²) numpy per step = O(radius * a²) total.
     """
     n = len(ciphertext)
+    ci = [alphabet[c] for c in ciphertext]
+    a = alph_size
 
     cand = int(np.argmax(_bigram_mi_scores(ciphertext)))
 
     enc_l = map_estimate(ciphertext[:cand], burn_in=_FULL_BURN_IN, num_iterations=_FULL_ITERATIONS)
     enc_r = map_estimate(ciphertext[cand:], burn_in=_FULL_BURN_IN, num_iterations=_FULL_ITERATIONS)
+    inv_l = np.array(inv(enc_l))
+    inv_r = np.array(inv(enc_r))
 
-    # Fixed-cipher sweep: no MCMC, just LL evaluation at each candidate split.
     radius = max(100, int(np.sqrt(n)) * 3)
     lo = max(0, cand - radius)
     hi = min(n, cand + radius)
-    best_s = cand
-    best_ll = log_likelihood(ciphertext[:cand], enc_l) + log_likelihood(ciphertext[cand:], enc_r)
+
+    # Build bg_total once: all bigrams in ciphertext
+    bg_total = np.zeros((a, a))
+    for k in range(n - 1):
+        bg_total[ci[k], ci[k + 1]] += 1
+
+    # cum_bg_s represents the bigram count matrix for ciphertext[:s]
+    # (bigrams k = 0..s-2 that lie entirely within the left segment).
+    # Initialise to cum_bg[lo]: bigrams k = 0..lo-2.
+    cum_bg_s = np.zeros((a, a))
+    for k in range(lo - 1):
+        cum_bg_s[ci[k], ci[k + 1]] += 1
+
+    # bg_right = bigrams entirely within ciphertext[s:] = bg_total - cum_bg[s+1]
+    # cum_bg[s+1] = cum_bg[s] + bigram k=s-1.  Initialise for s=lo.
+    bg_right = (bg_total - cum_bg_s).copy()
+    if 0 < lo < n:
+        bg_right[ci[lo - 1], ci[lo]] -= 1   # remove straddle bigram k=lo-1
+
+    best_s = lo
+    best_ll = -np.inf
     for s in range(lo, hi + 1):
-        if s == cand:
-            continue
-        ll = log_likelihood(ciphertext[:s], enc_l) + log_likelihood(ciphertext[s:], enc_r)
+        ll_l = _ll_fast(cum_bg_s, ci[0], inv_l) if s > 0 else 0.0
+        ll_r = _ll_fast(bg_right, ci[s],  inv_r) if s < n else 0.0
+        ll = ll_l + ll_r
         if ll > best_ll:
             best_ll = ll
             best_s = s
+
+        # Advance to s+1:
+        #   cum_bg[s+1] = cum_bg[s] + bigram k=s-1
+        #   bg_right_{s+1} = bg_right_s − bigram k=s
+        if 0 < s < n:
+            cum_bg_s[ci[s - 1], ci[s]] += 1
+        if s < n - 1:
+            bg_right[ci[s], ci[s + 1]] -= 1
 
     return best_s, enc_l, enc_r
 
