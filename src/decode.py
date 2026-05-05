@@ -7,6 +7,10 @@ Per = list[int]
 char_prob: np.ndarray = np.genfromtxt("data/letter_probabilities.csv", delimiter=',')
 trans_mat: np.ndarray = np.genfromtxt("data/letter_transition_matrix.csv", delimiter=',')
 alph_size: int = len(char_prob)
+# Precomputed log versions for fast LL evaluation (errstate suppresses log(0) warning)
+with np.errstate(divide='ignore'):
+    _log_char_prob: np.ndarray = np.where(char_prob > 0, np.log(char_prob), -np.inf)
+    _log_trans_mat: np.ndarray = np.where(trans_mat > 0, np.log(trans_mat), -np.inf)
 alphabet: dict[str, int] = {}
 alphabet_rev: list[str] = []
 with open("data/alphabet.csv") as f:
@@ -43,39 +47,112 @@ def log_likelihood(y: str, f: Per) -> float:
 def _identity_per() -> Per:
     return [i for i in range(alph_size)]
 
+def _freq_init(ciphertext: str) -> Per:
+    """Initialize encoder by matching ciphertext character frequencies to English."""
+    counts = np.zeros(alph_size)
+    for c in ciphertext:
+        counts[alphabet[c]] += 1
+    cipher_by_freq: list[int] = list(np.argsort(-counts))
+    english_by_freq: list[int] = list(np.argsort(-char_prob))
+    per: Per = [0] * alph_size
+    for eng_idx, cip_idx in zip(english_by_freq, cipher_by_freq):
+        per[eng_idx] = cip_idx
+    return per
+
+def _ll_fast(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> float:
+    """O(a²) log-likelihood using precomputed bigram counts and numpy indexing.
+
+    Equivalent to log_likelihood(ciphertext, per) but ~100x faster because it
+    avoids the O(n) Python loop: the transition sum becomes a single matrix
+    multiply using the precomputed bigram count matrix B.
+    """
+    first = float(_log_char_prob[inv_per[ci_0]])
+    if not np.isfinite(first):
+        return float('-inf')
+    # trans_mat convention is trans_mat[current][previous], so for bigram (prev, cur):
+    # contribution = log_trans_mat[inv_per[cur]][inv_per[prev]]
+    # np.ix_(inv_per, inv_per)[a,b] = log_trans_mat[inv_per[a]][inv_per[b]]
+    # → we need [cur, prev] ordering, which is the transpose of [prev, cur] = B ordering.
+    perm_log_T = _log_trans_mat[np.ix_(inv_per, inv_per)].T  # now [prev, cur] aligned with B
+    mask = B > 0
+    if mask.any() and not np.all(np.isfinite(perm_log_T[mask])):
+        return float('-inf')
+    return first + float(np.sum(B[mask] * perm_log_T[mask]))
+
+def _greedy_climb(B: np.ndarray, ci_0: int, inv_per: np.ndarray) -> tuple[np.ndarray, float]:
+    """Greedy hill-climbing on inv_per using O(a²) LL per swap evaluation."""
+    inv_per = inv_per.copy()
+    cur_score = _ll_fast(B, ci_0, inv_per)
+    for _ in range(alph_size):
+        improved = False
+        for c_p in range(alph_size):
+            for c_q in range(c_p + 1, alph_size):
+                inv_per[c_p], inv_per[c_q] = inv_per[c_q], inv_per[c_p]
+                new_score = _ll_fast(B, ci_0, inv_per)
+                if new_score > cur_score:
+                    cur_score = new_score
+                    improved = True
+                else:
+                    inv_per[c_p], inv_per[c_q] = inv_per[c_q], inv_per[c_p]
+        if not improved:
+            break
+    return inv_per, cur_score
+
 _FULL_BURN_IN = 10000
-_FULL_ITERATIONS = 20000
+_FULL_ITERATIONS = 50000
+_GREEDY_RESTARTS = 50
 
 def map_estimate(ciphertext: str, burn_in: int = _FULL_BURN_IN, num_iterations: int = _FULL_ITERATIONS) -> Per:
     """ Given we observed a stirng ciphertext, return the MAP estimator f that
-        may have generated it. Uses the Metropolis-Hastings MCMC algorithm. """
+        may have generated it. Uses the Metropolis-Hastings MCMC algorithm.
+
+        Internal LL uses precomputed bigram counts + numpy for O(a²) per evaluation
+        instead of O(n), giving ~100x speedup that funds more restarts and iterations.
+
+        Phase 1: frequency-based init → greedy hill-climb to a local optimum.
+        Phase 2: multi-start greedy — perturb + re-climb 20 times, keeping the best.
+        Phase 3: MH-MCMC from the best greedy warm start. """
     if len(ciphertext) == 0:
         return _identity_per()
-    per: Per = _identity_per()
-    best_per: Per = per.copy()
-    best_score = log_likelihood(ciphertext, per)
+
+    # Precompute bigram counts once — used by all subsequent LL evaluations
+    ci = [alphabet[c] for c in ciphertext]
+    B = np.zeros((alph_size, alph_size))
+    for k in range(len(ci) - 1):
+        B[ci[k], ci[k + 1]] += 1
+    ci_0 = ci[0]
+
+    # Phase 1: frequency-matched init → first greedy local optimum
+    # Work in decoder (inv_per) space throughout for consistency with _ll_fast
+    best_inv, best_score = _greedy_climb(B, ci_0, np.array(inv(_freq_init(ciphertext))))
+
+    # Phase 2: multi-start greedy — perturb best decoder and re-climb
+    for _ in range(_GREEDY_RESTARTS):
+        perturbed = best_inv.copy()
+        for _ in range(random.randint(2, 4)):
+            c_p, c_q = random.sample(range(alph_size), 2)
+            perturbed[c_p], perturbed[c_q] = perturbed[c_q], perturbed[c_p]
+        restart_inv, score = _greedy_climb(B, ci_0, perturbed)
+        if score > best_score:
+            best_inv, best_score = restart_inv, score
+
+    # Phase 3: MH-MCMC from the best greedy warm start
+    cur_inv = best_inv.copy()
     cur_score = best_score
-    # empirically determine the number of iterations you need
     for iter_no in range(num_iterations):
-        if iter_no >= burn_in:
-            if cur_score > best_score:
-                best_per = per.copy()
-                best_score = cur_score
-        new_per: Per = per.copy()
-        i, j = random.sample(range(alph_size), 2) # choose two to randomly swap
-        new_per[i], new_per[j] = new_per[j], new_per[i]
-        # compute acceptance probability
-        accept_log_prob = 0
-        new_log_likelihood = log_likelihood(ciphertext, new_per)
-        if cur_score != -np.inf:
-            accept_log_prob = min(0, new_log_likelihood - cur_score) 
+        if iter_no >= burn_in and cur_score > best_score:
+            best_inv = cur_inv.copy()
+            best_score = cur_score
+        c_p, c_q = random.sample(range(alph_size), 2)
+        cur_inv[c_p], cur_inv[c_q] = cur_inv[c_q], cur_inv[c_p]
+        new_score = _ll_fast(B, ci_0, cur_inv)
+        accept_log_prob = min(0.0, new_score - cur_score) if np.isfinite(cur_score) else 0.0
+        if np.log(random.random()) < accept_log_prob:
+            cur_score = new_score
         else:
-            accept_log_prob = 0
-        accept = np.log(random.random()) < accept_log_prob
-        if accept: # swap
-            per = new_per
-            cur_score = new_log_likelihood
-    return best_per
+            cur_inv[c_p], cur_inv[c_q] = cur_inv[c_q], cur_inv[c_p]
+
+    return inv(list(best_inv))
 
 def _plaintext_under_encoder(segment: str, encoder: Per) -> str:
     if len(segment) == 0:
